@@ -15,6 +15,7 @@
 <link rel="apple-touch-icon-precomposed" sizes="180x180" href="./icon-180-v2.png">
 <link rel="icon" type="image/png" sizes="192x192" href="./icon-192-v2.png">
 <link rel="icon" type="image/png" sizes="512x512" href="./icon-512-v2.png">
+<script src="./vein-config.js"></script>
 <style>html,body{background:#F4F2EE}</style>
 </head>
 <body>
@@ -251,6 +252,7 @@ body.kb .tip{opacity:0}
   font-family:var(--f);background:var(--void2);resize:vertical}
 .set .paste::placeholder{color:var(--l16)}
 .set p b{font-weight:500;color:var(--l86)}
+.set .row .wide{flex:1 1 0;min-width:0}
 .set .wide{width:100%;min-height:46px;border:1px solid var(--l16);border-radius:23px;
   font-size:12px;letter-spacing:.06em;transition:background .2s}
 .set .wide:active{background:var(--l05)}
@@ -455,7 +457,11 @@ function fix(s){
   delete s.settings.key;          /* 鍵の概念をやめたので、残っていても捨てる */
   s.settings.seen=Array.isArray(s.settings.seen)?s.settings.seen:[];
   s.settings.prev=Array.isArray(s.settings.prev)?s.settings.prev:[];
-  s.entries=s.entries.filter(function(e){return e&&typeof e==='object'&&(e.raw||e.digest)});
+  /* 消した印（status:'gone'）は中身が空でも残す。
+     これが無いと、消した日記が端末の外から戻ってきてしまう。 */
+  s.entries=s.entries.filter(function(e){
+    return e&&typeof e==='object'&&(e.raw||e.digest||e.status==='gone');
+  });
   s.entries.forEach(function(e){
     e.id=String(e.id||('m'+Math.random().toString(36).slice(2,10)));
     e.raw=String(e.raw||'');
@@ -468,6 +474,7 @@ function fix(s){
     e.ask=String(e.ask||'');
     e.seed=String(e.seed||'');
     e.createdAt=String(e.createdAt||nowIso());
+    e.updatedAt=String(e.updatedAt||e.createdAt);   /* どちらが新しいかを決める印 */
     e.status=e.status||'draft';           /* draft → read → kept */
     e.day=e.day||(e.createdAt||'').slice(0,10)||today();
   });
@@ -478,13 +485,17 @@ function parse(raw){
   try{return fix(JSON.parse(raw))}catch(e){return null}
 }
 /* 足し合わせる。同じ id は、先へ進んでいるほう（kept > read > draft）を残す */
-var RANK={draft:0,read:1,kept:2};
+var RANK={draft:0,read:1,kept:2,gone:3};
 function merge(a,b){
   if(!a)return b;if(!b)return a;
   var by={},order=[];
   function put(e){
     var o=by[e.id];
     if(!o){by[e.id]=e;order.push(e.id);return}
+    /* まず「あとで触ったほう」。時刻が同じなら、先へ進んでいるほう・中身の多いほう */
+    var ua=String(o.updatedAt||o.createdAt||''),ub=String(e.updatedAt||e.createdAt||'');
+    if(ub>ua){by[e.id]=e;return}
+    if(ub<ua)return;
     var ra=RANK[o.status]||0,rb=RANK[e.status]||0;
     if(rb>ra||(rb===ra&&(e.lines.length>o.lines.length||e.raw.length>o.raw.length)))by[e.id]=e;
   }
@@ -565,6 +576,7 @@ function save(){
   }
 
   try{idbPut(json)['catch'](function(){})}catch(e){}
+  try{syncLater()}catch(e){}       /* 少し待ってから、端末の外へも送る */
 
   if(volatile&&!warned){warned=true;setTimeout(function(){say('この画面ではデータが残らない。ホーム画面に追加して使って。')},600)}
 }
@@ -1243,7 +1255,7 @@ $('clear').addEventListener('click',function(){
 $('keepBtn').addEventListener('click',function(){
   var t=text();
   if(t.length<4){say('ひとことだけでも');return}
-  var e={id:uid(),createdAt:nowIso(),day:today(),seed:seed,ask:pendingAsk,raw:t,
+  var e={id:uid(),createdAt:nowIso(),updatedAt:nowIso(),day:today(),seed:seed,ask:pendingAsk,raw:t,
          lines:[],digest:'',tags:[],picks:[],asks:[],notes:[],status:'draft'};
   state.entries.push(e);save();
   said.textContent='';$('mLen').textContent='';
@@ -1292,6 +1304,7 @@ document.addEventListener('visibilitychange',function(){
   }
   hiddenAt=0;
   start();
+  if(syncOn()&&signedIn())syncLater();
 });
 
 /* ───────── 喋ったものを組み立てる ─────────
@@ -1399,6 +1412,7 @@ function bulletsOf(e){
 
 /* 置いた直後に組み立てる。待ち時間は無い（外へ出ないので） */
 function shape(e){
+  e.updatedAt=nowIso();
   e.lines=sentences(e.raw);
   if(!e.lines.length)e.lines=[String(e.raw).trim()];
   e.tags=tagsLocal(e.lines);
@@ -1408,6 +1422,7 @@ function shape(e){
 
 /* ───────── 記録の面 ───────── */
 var filter='';
+function alive(){return state.entries.filter(function(e){return e.status!=='gone'})}
 function kept(){return state.entries.filter(function(e){return e.status==='kept'})}
 function tagCount(){
   var c={};
@@ -1415,14 +1430,14 @@ function tagCount(){
   return c;
 }
 function streak(){
-  var days={};state.entries.forEach(function(e){days[e.day]=1});
+  var days={};alive().forEach(function(e){days[e.day]=1});
   var d=new Date(),n=0;
   if(!days[ymd(d)]){d.setDate(d.getDate()-1);if(!days[ymd(d)])return 0}
   while(days[ymd(d)]){n++;d.setDate(d.getDate()-1)}
   return n;
 }
 function draw(){
-  var days={};state.entries.forEach(function(e){days[e.day]=1});
+  var days={};alive().forEach(function(e){days[e.day]=1});
   var tc=tagCount(),tags=Object.keys(tc);
   $('cDays').textContent=Object.keys(days).length;
   $('cRow').textContent=streak();
@@ -1438,10 +1453,10 @@ function draw(){
   });
 
   var list=$('list');list.innerHTML='';
-  var rows=state.entries.filter(function(e){return !filter||e.tags.indexOf(filter)>=0});
+  var rows=alive().filter(function(e){return !filter||e.tags.indexOf(filter)>=0});
   if(!rows.length){
     var p=document.createElement('div');p.className='empty';
-    p.textContent=filter?'この見出しはまだ無い':(state.entries.length?'':'◯ を押して、今日を喋る');
+    p.textContent=filter?'この見出しはまだ無い':(alive().length?'':'◯ を押して、今日を喋る');
     list.appendChild(p);
     $('axis').style.visibility='hidden';
     return;
@@ -1575,7 +1590,7 @@ function entryText(e){
   return L.join('\n');
 }
 function allText(){
-  var es=state.entries.slice().sort(function(a,b){return a.createdAt<b.createdAt?1:-1});
+  var es=alive().slice().sort(function(a,b){return a.createdAt<b.createdAt?1:-1});
   var L=['# journaling　'+today()+' 時点', '', es.length+'件 / '+Object.keys(es.reduce(function(o,e){o[e.day]=1;return o},{})).length+'日', ''];
   es.forEach(function(e){L.push(entryText(e))});
   return L.join('\n');
@@ -1604,6 +1619,170 @@ function copy(text,btn){
   else fallback();
 }
 
+/* ───────── 端末をまたいで残す（sync） ─────────
+   アプリを消すと日記も消える、をなくすための唯一の道。
+   Sokugan と同じ形にしてある。
+
+   ・日記は「1ユーザー1行」の JSONB。マージはここ（クライアント）でやる
+   ・rev で楽観的排他。読んだときの rev と違えば0件更新になり、再pullして再試行する
+   ・入っていなければ、これまでどおり端末の中だけで動く（同期は足すだけ）
+
+   Sokugan と同じ Supabase プロジェクトなので、**同じメールとパスワードで入れる**。 */
+var AUTH_KEY='vein_auth';
+var SYNC_TABLE='vein_state';
+var SYNC_WAIT=2000;
+var sync={status:'off',at:null,err:null,busy:false,again:false};
+var syncTimer=null;
+
+function syncCfg(){
+  var c=(typeof window!=='undefined'&&window.VEIN_CONFIG)||{};
+  if(!c.supabaseUrl||!c.supabaseAnonKey)return null;
+  return {url:String(c.supabaseUrl).replace(/\/+$/,''),key:String(c.supabaseAnonKey)};
+}
+function syncOn(){return !!syncCfg()}
+function loadAuth(){try{return JSON.parse(store.get(AUTH_KEY)||'null')}catch(e){return null}}
+function saveAuth(a){try{a?store.set(AUTH_KEY,JSON.stringify(a)):store.del(AUTH_KEY)}catch(e){}}
+function signedIn(){var a=loadAuth();return !!(a&&a.access_token&&a.user_id)}
+function syncMail(){var a=loadAuth();return a?a.email:''}
+
+function sb(path,opt){
+  var cfg=syncCfg();
+  if(!cfg)return Promise.reject(new Error('同期は未設定'));
+  opt=opt||{};
+  var a=loadAuth(),h={apikey:cfg.key,'Content-Type':'application/json'};
+  for(var k in (opt.headers||{}))h[k]=opt.headers[k];
+  if(a&&a.access_token)h.Authorization='Bearer '+a.access_token;
+  return fetch(cfg.url+path,{method:opt.method||'GET',headers:h,body:opt.body});
+}
+/* Supabase が返す英語を、そのまま出さない */
+function jaErr(m){
+  m=String(m||'');
+  if(/Invalid login credentials/i.test(m))return 'メールかパスワードが違う';
+  if(/already registered/i.test(m))return 'そのメールはもう登録されている。「入る」を押して';
+  if(/Email not confirmed/i.test(m))return '確認メールを開いてから、もう一度';
+  if(/rate limit|too many/i.test(m))return '試しすぎ。少し待って';
+  if(/Password should be/i.test(m))return 'パスワードが短い';
+  return m||'入れなかった';
+}
+function authIn(mode,mail,pass){
+  var route=mode==='signup'?'/auth/v1/signup':'/auth/v1/token?grant_type=password';
+  return sb(route,{method:'POST',body:JSON.stringify({email:mail,password:pass})})
+    .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})})
+    .then(function(x){
+      if(!x.ok)throw new Error(jaErr(x.j.msg||x.j.error_description||x.j.message||''));
+      if(!x.j.access_token)throw new Error('確認メールが届いている。開いてから「入る」を押して');
+      saveAuth({access_token:x.j.access_token,refresh_token:x.j.refresh_token,
+                user_id:x.j.user&&x.j.user.id,email:(x.j.user&&x.j.user.email)||mail});
+      return true;
+    });
+}
+function refreshAuth(){
+  var a=loadAuth();
+  if(!a||!a.refresh_token)return Promise.resolve(false);
+  return sb('/auth/v1/token?grant_type=refresh_token',
+    {method:'POST',body:JSON.stringify({refresh_token:a.refresh_token})})
+    .then(function(r){return r.ok?r.json():null})
+    .then(function(j){
+      if(!j||!j.access_token)return false;
+      saveAuth({access_token:j.access_token,refresh_token:j.refresh_token||a.refresh_token,
+                user_id:a.user_id,email:a.email});
+      return true;
+    })['catch'](function(){return false});
+}
+function signOut(){
+  saveAuth(null);
+  sync={status:'out',at:null,err:null,busy:false,again:false};
+  drawSet();
+}
+
+/* 送る形。端末ごとの事情（この端末で永続化できたか）は持っていかない */
+function forCloud(st){
+  return {version:1,entries:st.entries,
+          settings:{seen:(st.settings.seen||[]),prev:(st.settings.prev||[])}};
+}
+function pullRow(){
+  var q='/rest/v1/'+SYNC_TABLE+'?select=state,rev';
+  return sb(q).then(function(r){
+    if(r.status===401)return refreshAuth().then(function(ok){
+      if(!ok)throw new Error('もう一度入り直して');
+      return sb(q);
+    });
+    return r;
+  }).then(function(r){
+    if(r.status===401)throw new Error('もう一度入り直して');
+    if(!r.ok)throw new Error('読めなかった ('+r.status+')');
+    return r.json();
+  }).then(function(rows){return (rows&&rows[0])?rows[0]:null});
+}
+/* true=書けた / false=revが合わない（誰かが先に書いた→もう一度） */
+function pushRow(st,rev){
+  var a=loadAuth(),body={state:forCloud(st)};
+  if(rev==null){
+    body.user_id=a.user_id;body.rev=1;
+    return sb('/rest/v1/'+SYNC_TABLE,{method:'POST',
+      headers:{Prefer:'return=minimal,resolution=merge-duplicates'},body:JSON.stringify(body)})
+      .then(function(r){
+        if(r.status===409)return false;
+        if(!r.ok)throw new Error('書けなかった ('+r.status+')');
+        return true;
+      });
+  }
+  body.rev=rev+1;
+  return sb('/rest/v1/'+SYNC_TABLE+'?user_id=eq.'+encodeURIComponent(a.user_id)+'&rev=eq.'+rev,
+    {method:'PATCH',headers:{Prefer:'return=representation'},body:JSON.stringify(body)})
+    .then(function(r){
+      if(!r.ok)throw new Error('書けなかった ('+r.status+')');
+      return r.json();
+    }).then(function(rows){return !!(rows&&rows.length)});
+}
+function offlineErr(e){
+  if(typeof navigator!=='undefined'&&navigator&&navigator.onLine===false)return true;
+  return /Failed to fetch|NetworkError|network|offline|fetch failed/i.test(String((e&&e.message)||e));
+}
+function syncNow(){
+  if(!syncOn()){sync.status='off';return Promise.resolve(false)}
+  if(!signedIn()){sync.status='out';return Promise.resolve(false)}
+  if(sync.busy){sync.again=true;return Promise.resolve(false)}
+  sync.busy=true;sync.status='doing';sync.err=null;drawSet();
+
+  var tries=0;
+  function round(){
+    tries++;
+    return pullRow().then(function(row){
+      var remote=(row&&row.state&&row.state.entries)?fix(JSON.parse(JSON.stringify(row.state))):null;
+      var before=state.entries.length;
+      if(remote)state=merge(state,remote);
+      var got=state.entries.length-before;
+      save();
+      if(got>0){draw();say('端末の外から '+got+'件を戻した')}
+      return pushRow(state,row?row.rev:null).then(function(ok){
+        if(ok)return true;
+        if(tries<3)return round();        /* rev が合わない＝先に書かれた。読み直してやり直す */
+        throw new Error('あとでもう一度');
+      });
+    });
+  }
+  return round().then(function(){
+    sync.status='ok';sync.at=new Date();sync.err=null;
+    return true;
+  })['catch'](function(e){
+    if(offlineErr(e)){sync.status='wait';sync.again=true}
+    else{sync.status='err';sync.err=String((e&&e.message)||e)}
+    return false;
+  })['then'](function(r){
+    sync.busy=false;drawSet();
+    if(sync.again&&sync.status==='ok'){sync.again=false;setTimeout(syncNow,600)}
+    return r;
+  });
+}
+function syncLater(){
+  if(!syncOn()||!signedIn())return;
+  sync.again=true;
+  if(syncTimer)clearTimeout(syncTimer);
+  syncTimer=setTimeout(function(){syncTimer=null;syncNow()},SYNC_WAIT);
+}
+window.addEventListener('online',function(){syncLater()});
+
 /* ───────── 設定の面 ─────────
    鍵は日記の並びの中には置かない（毎日見るものではないので、目的が読めなくなる）。 */
 var setSheet=$('set');
@@ -1619,19 +1798,91 @@ function closeSet(){
 $('setClose').addEventListener('click',closeSet);
 $('openSet').addEventListener('click',openSet);
 $('copyAll').addEventListener('click',function(){
-  if(!state.entries.length){say('まだ1件も無い');return}
+  if(!alive().length){say('まだ1件も無い');return}
   copy(allText(),this);
 });
+
+/* 端末をまたいで残す枠。入っていなければ入口、入っていれば様子と手動の一押し */
+function syncBlock(){
+  var d=document.createElement('div');d.className='blk';
+  d.innerHTML='<h3 class="lo">sync</h3>';
+
+  if(!signedIn()){
+    var row=document.createElement('div');row.className='row';
+    row.innerHTML='<input id="syMail" type="email" inputmode="email" autocomplete="email" placeholder="メール">';
+    var row2=document.createElement('div');row2.className='row';row2.style.marginTop='8px';
+    row2.innerHTML='<input id="syPass" type="password" autocomplete="current-password" placeholder="パスワード（8字以上）">';
+    d.appendChild(row);d.appendChild(row2);
+
+    var acts=document.createElement('div');acts.className='row';acts.style.marginTop='12px';
+    var inBtn=document.createElement('button');inBtn.className='wide';inBtn.textContent='入る';
+    var upBtn=document.createElement('button');upBtn.className='wide';upBtn.textContent='はじめて登録';
+    function go(mode,btn){
+      var m=($('syMail').value||'').trim(),pw=($('syPass').value||'');
+      if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(m)){say('メールの形を確かめて');return}
+      if(pw.length<8){say('パスワードは8字以上');return}
+      btn.textContent='…';
+      authIn(mode,m,pw).then(function(){
+        say('入った。日記を合わせる');
+        drawSet();
+        return syncNow();
+      })['catch'](function(e){
+        say(String((e&&e.message)||e));
+        drawSet();
+      });
+    }
+    inBtn.addEventListener('click',function(){go('login',inBtn)});
+    upBtn.addEventListener('click',function(){go('signup',upBtn)});
+    acts.appendChild(inBtn);acts.appendChild(upBtn);
+    d.appendChild(acts);
+
+    var p1=document.createElement('p');
+    p1.innerHTML='入ると、日記は<b>この端末の外にも残る</b>。アプリを消しても、端末を替えても、'+
+      '同じメールで入れば戻ってくる。Sokugan と同じ入り口なので、<b>同じメールとパスワードで入れる</b>。';
+    d.appendChild(p1);
+    var p2=document.createElement('p');
+    p2.textContent='入らなくても、これまでどおり端末の中だけで使える。';
+    d.appendChild(p2);
+    return d;
+  }
+
+  var st={doing:'合わせている…',ok:'合った',wait:'圏外。つながったら送る',err:('つながらない'+(sync.err?'（'+sync.err+'）':'')),out:'',off:''}[sync.status]||'まだ合わせていない';
+  var when=sync.at?(' '+String(sync.at.getHours()).padStart(2,'0')+':'+String(sync.at.getMinutes()).padStart(2,'0')):'';
+  var info=document.createElement('p');
+  info.innerHTML='<b>'+esc(syncMail())+'</b> で入っている。'+esc(st+when)+'。'+
+    '書くたびに送っていて、開いたときにも合わせる。';
+  d.appendChild(info);
+
+  var acts2=document.createElement('div');acts2.className='row';acts2.style.marginTop='4px';
+  var nowBtn=document.createElement('button');nowBtn.className='wide';nowBtn.textContent='いま合わせる';
+  nowBtn.addEventListener('click',function(){
+    nowBtn.textContent='…';
+    syncNow().then(function(ok){say(ok?'合った':'合わなかった');drawSet()});
+  });
+  var outBtn=document.createElement('button');outBtn.className='wide';outBtn.textContent='出る';
+  outBtn.addEventListener('click',function(){
+    say('この端末から出る？日記は端末に残る','yes',function(){signOut();say('出た')});
+  });
+  acts2.appendChild(nowBtn);acts2.appendChild(outBtn);
+  d.appendChild(acts2);
+
+  var p3=document.createElement('p');
+  p3.textContent='出ても、この端末の日記は消えない。次に入れば、外にあるぶんと足し合わせる。';
+  d.appendChild(p3);
+  return d;
+}
 
 function drawSet(){
   var b=$('setBody');b.className='body set';b.innerHTML='';
 
+  if(syncOn())b.appendChild(syncBlock());
+
   var c=document.createElement('div');c.className='blk';
   c.innerHTML='<h3 class="lo">copy</h3>';
   var cb=document.createElement('button');
-  cb.className='wide';cb.textContent='日記を全部うつす（'+state.entries.length+'件）';
+  cb.className='wide';cb.textContent='日記を全部うつす（'+alive().length+'件）';
   cb.addEventListener('click',function(){
-    if(!state.entries.length){say('まだ1件も無い');return}
+    if(!alive().length){say('まだ1件も無い');return}
     copy(allText());
   });
   c.appendChild(cb);
@@ -1644,13 +1895,15 @@ function drawSet(){
   d.innerHTML='<h3 class="lo">data</h3>';
   var info=document.createElement('p');
   var snaps=store.keys().filter(function(k){return k.indexOf(SNAP)===0}).length;
-  info.innerHTML='いま <b>'+state.entries.length+'件</b>。'+
+  info.innerHTML='いま <b>'+alive().length+'件</b>。'+
     '同じものを3か所に置いている（すぐ読む場所・端末の中の控え・日ごとの控え '+snaps+'日ぶん）。'+
     '開くたびに全部を足し合わせるので、どれか1つ消えても戻る。'+
     (state.settings.persisted?'この端末では「消さない」扱いになっている。':'')+
     '<br><br>ただし<b>ホーム画面のアイコンを消して入れ直すと、置き場所ごと消える</b>。'+
     'Safari で開いたときと、ホーム画面から開いたときで、別の置き場所になることもある。'+
-    '移すときは、下の export と import を使う。';
+    (signedIn()?'いまは sync で外にも残しているので、そうなっても入り直せば戻る。':
+                '上の sync に入ると、端末の外にも残るので、そうなっても戻る。')+
+    '手で移すときは、下の export と import を使う。';
   d.appendChild(info);
   b.appendChild(d);
 
@@ -1726,7 +1979,7 @@ var sheet=$('sheet'),openId='';
 function openSheet(e){
   openId=e.id;
   stop();
-  if(e.status==='draft'){e.status='read';save();draw()}
+  if(e.status==='draft'){e.status='read';e.updatedAt=nowIso();save();draw()}
   sheet.classList.add('on');sheet.setAttribute('aria-hidden','false');
   track.classList.add('lock');
   drawSheet(e);
@@ -1785,7 +2038,7 @@ function drawSheet(e){
   if(e.status!=='kept'){
     var k=document.createElement('button');k.className='keep lo';k.textContent='keep';
     k.addEventListener('click',function(){
-      e.status='kept';save();draw();closeSheet();
+      e.status='kept';e.updatedAt=nowIso();save();draw();closeSheet();
       say(e.tags.length?'#'+e.tags[0]+' で並べた':'並べた');
     });
     foot.appendChild(k);
@@ -1794,8 +2047,20 @@ function drawSheet(e){
   f2.addEventListener('click',function(){
     say('この日記を消す？','yes',function(){
       var i=state.entries.indexOf(e);
-      if(i>=0){var back=state.entries.splice(i,1)[0];save();draw();closeSheet();
-        say('消した','undo',function(){state.entries.push(back);save();draw()})}
+      if(i<0)return;
+      var back=JSON.parse(JSON.stringify(e));          /* 戻せるように、手元にだけ取っておく */
+      /* 行ごと抜くと、端末の外に残っているぶんが次に戻ってきてしまう。
+         中身を落として「消した印」だけ残す。 */
+      state.entries[i]={id:e.id,createdAt:e.createdAt,updatedAt:nowIso(),day:e.day,
+                        seed:'',ask:'',raw:'',lines:[],digest:'',tags:[],
+                        picks:[],asks:[],notes:[],status:'gone'};
+      save();draw();closeSheet();
+      say('消した','undo',function(){
+        var j=state.entries.map(function(x){return x.id}).indexOf(back.id);
+        back.updatedAt=nowIso();
+        if(j>=0)state.entries[j]=back;else state.entries.push(back);
+        save();draw();
+      });
     });
   });
   foot.appendChild(f2);
@@ -1865,6 +2130,7 @@ document.addEventListener('keydown',function(e){
 place();
 syncIdb();          /* IndexedDB の控えと足し合わせる */
 askPersist();       /* 端末に「消さないで」と頼む */
+if(syncOn()&&signedIn())setTimeout(syncNow,800);   /* 端末の外とも合わせる */
 draw();
 $('tip').textContent=state.entries.length?'':'press';
 goPane(0,false);
